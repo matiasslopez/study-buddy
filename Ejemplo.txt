@@ -1,0 +1,15 @@
+Un diagrama entidad relacion
+Un modelo entidad-relación es una herramienta para el modelo de datos, la cual facilita la representación de entidades de una base de datos.[1]​ Fue definido por Peter Chen en 1976.
+Entidad
+Representa una “cosa”, "objeto", o "concepto" del mundo real con existencia independiente, es decir, se diferencia únicamente de otro objeto o cosa, incluso siendo del mismo tipo, o una misma entidad.
+Atributos
+Los atributos son las características que definen o identifican a una entidad. estas pueden ser muchas, y el diseñador solo utiliza o implementa las que considere mas relevantes.
+Correspondencia de cardinalidades
+Dado un conjunto de relaciones en el que participan dos o mas conjuntos de entidades, la cardinalidad de la correspondencia indica el número de entidades con las que puede estar relacionada una entidad dada.
+
+Dado un conjunto de relaciones binarias y los conjuntos de entidades A y B, las cardinalidades pueden ser:
+
+Uno a Uno: (1:1) Un registro de una entidad A se relaciona con solo un registro en una entidad B. (ejemplo dos entidades, profesor y departamento, con llaves primarias, codigo_profesor y jefe_depto respectivamente, un profesor solo puede ser jefe de un departamento y un departamento solo puede tener un jefe).
+Uno a Varios: (1:N) Un registro en una entidad en A se relaciona con un B. Pero los registros de B se relacionan con uno o muchos registros en una entidad A. (ejemplo: dos entidades, vendedor y ventas, con llaves primarias, codigo_vendedor y venta, respectivamente, un vendedor puede tener muchas ventas pero una venta solo puede tener un vendedor).
+Varios a Uno: (N:1) Una entidad en A se relaciona con varios registros con una entidad en B. Pero una entidad en B se puede relacionar con un solo registro de la entidad A. (ejemplo empleado-centro de trabajo).
+Varios a Varios: (N:M) Una entidad en A se puede relacionar con 1 o con muchas entidades en B y viceversa (ejemplo asociaciones-ciudadanos, donde muchos ciudadanos pueden pertenecer a una misma asociacion, y cada ciudadano puede pertenecer a muchas asociaciones distintas).

@@ -1,0 +1,14 @@
+# Entorno
+venv/
+.env
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
+
+# SO / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
