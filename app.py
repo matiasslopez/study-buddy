@@ -4,11 +4,11 @@ import time
 import re
 import unicodedata
 import string
-import requests  # opcional: lo dejamos por compatibilidad
+import requests  # opcional
 import httpx
 import streamlit as st
 from dotenv import load_dotenv
-from datetime import datetime  # <-- para control diario
+from datetime import datetime
 
 # Similitud difusa (opcional)
 try:
@@ -18,9 +18,22 @@ except Exception:
 
 # ====== Config ======
 load_dotenv()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# Leer API key de Secrets (Cloud) o .env (local)
+OPENROUTER_API_KEY = (
+    st.secrets.get("OPENROUTER_API_KEY")
+    or os.getenv("OPENROUTER_API_KEY")
+)
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "openai/gpt-4o-mini"
+
+# Headers extra recomendados (no obligatorios) por OpenRouter
+OPENROUTER_HEADERS_EXTRA = {
+    # Si querés, seteá tu URL pública en Secrets como APP_URL
+    "HTTP-Referer": st.secrets.get("APP_URL", ""),
+    "X-Title": "Study Buddy",
+}
 
 st.set_page_config(
     page_title="📘 Study Buddy - Entrenador de parciales",
@@ -55,16 +68,24 @@ with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
 """
     )
 
-# ====== Control de uso diario ======
-MAX_QUESTIONS_PER_DAY = 60  # ajustá este número a gusto
-today_str = datetime.utcnow().strftime("%Y-%m-%d")
+# ====== Límite diario configurable por Secrets/entorno ======
+def _get_int(value, default):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
 
+MAX_QUESTIONS_PER_DAY = _get_int(
+    st.secrets.get("MAX_QUESTIONS_PER_DAY", os.getenv("MAX_QUESTIONS_PER_DAY", 60)),
+    60
+)
+
+# ====== Control de uso diario ======
+today_str = datetime.utcnow().strftime("%Y-%m-%d")
 if "usage_date" not in st.session_state:
     st.session_state.usage_date = today_str
 if "questions_used" not in st.session_state:
     st.session_state.questions_used = 0
-
-# Reset diario si cambió el día
 if st.session_state.usage_date != today_str:
     st.session_state.usage_date = today_str
     st.session_state.questions_used = 0
@@ -73,11 +94,15 @@ if st.session_state.usage_date != today_str:
 def call_openrouter(messages, max_tokens=800, temperature=0.6, model=DEFAULT_MODEL):
     """Cliente robusto con httpx, HTTP/1.1 y reintentos para evitar errores TLS."""
     if not OPENROUTER_API_KEY:
-        raise RuntimeError("No se encontró OPENROUTER_API_KEY. Definila en tu .env")
+        raise RuntimeError(
+            "No se encontró OPENROUTER_API_KEY. "
+            "Cargá el secreto en Streamlit Cloud (⋮ → Settings → Secrets) o definilo en tu .env local."
+        )
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
+        **OPENROUTER_HEADERS_EXTRA,
     }
     body = {
         "model": model,
@@ -350,12 +375,13 @@ Devolvé JSON puro (sin comentarios ni texto extra).
                         st.session_state.questions = questions
                         st.session_state.answers = {}
                         st.session_state.checked = {}
-                        # ✔️ Actualizamos el uso solo si se generó OK
-                        st.session_state.questions_used += int(q_count)
+                        st.session_state.questions_used += int(q_count)  # sumar uso solo si salió ok
                         st.success("✅ Preguntas listas")
                     except Exception as e:
                         msg = str(e)
-                        if "429" in msg:
+                        if "401" in msg:
+                            st.error("🔐 401 Unauthorized: revisá tu OPENROUTER_API_KEY en Secrets.")
+                        elif "429" in msg:
                             st.error("⚠️ Límite de uso de la API (429). Reducí la cantidad o intentá más tarde.")
                         else:
                             st.error(f"No se pudieron generar preguntas. Detalle: {e}")
