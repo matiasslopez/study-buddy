@@ -4,10 +4,11 @@ import time
 import re
 import unicodedata
 import string
-import requests  # lo dejamos por compatibilidad si lo usabas antes
+import requests  # opcional: lo dejamos por compatibilidad
 import httpx
 import streamlit as st
 from dotenv import load_dotenv
+from datetime import datetime  # <-- para control diario
 
 # Similitud difusa (opcional)
 try:
@@ -53,6 +54,20 @@ with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
 > Tip: si cambiás opciones o bibliografía, podés volver a generar preguntas para una nueva ronda de práctica.
 """
     )
+
+# ====== Control de uso diario ======
+MAX_QUESTIONS_PER_DAY = 60  # ajustá este número a gusto
+today_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+if "usage_date" not in st.session_state:
+    st.session_state.usage_date = today_str
+if "questions_used" not in st.session_state:
+    st.session_state.questions_used = 0
+
+# Reset diario si cambió el día
+if st.session_state.usage_date != today_str:
+    st.session_state.usage_date = today_str
+    st.session_state.questions_used = 0
 
 # ====== Helpers ======
 def call_openrouter(messages, max_tokens=800, temperature=0.6, model=DEFAULT_MODEL):
@@ -200,6 +215,9 @@ with st.sidebar:
     threshold = st.slider("Umbral de aceptación (%)", 50, 95, 70) if lenient else 0
     show_diag = st.checkbox("Mostrar diagnóstico detallado", value=True)
 
+    # Mostrar uso diario en la sidebar
+    st.caption(f"📊 Uso diario: {st.session_state.questions_used}/{MAX_QUESTIONS_PER_DAY} preguntas")
+
 # ====== Uploader ======
 st.markdown(
     """
@@ -266,14 +284,21 @@ with col1:
         if not corpus.strip():
             st.warning("Subí al menos un archivo con contenido primero.")
         else:
-            extra = ""
-            if add_wiki:
-                with st.spinner("Buscando bibliografía de apoyo en Wikipedia..."):
-                    extra = enrich_with_wikipedia(corpus)
-                    if extra:
-                        st.info("Se agregó bibliografía extra de Wikipedia.")
+            # Chequeo de cuota ANTES de invocar a la IA
+            if st.session_state.questions_used + int(q_count) > MAX_QUESTIONS_PER_DAY:
+                st.warning(
+                    f"⚠️ Alcanzaste el límite diario de {MAX_QUESTIONS_PER_DAY} preguntas en esta sesión. "
+                    "Reducí la cantidad o intentá mañana."
+                )
+            else:
+                extra = ""
+                if add_wiki:
+                    with st.spinner("Buscando bibliografía de apoyo en Wikipedia..."):
+                        extra = enrich_with_wikipedia(corpus)
+                        if extra:
+                            st.info("Se agregó bibliografía extra de Wikipedia.")
 
-            sys_prompt = """
+                sys_prompt = """
 Sos un generador de preguntas para preparar exámenes.
 Devolvé SIEMPRE un JSON válido con esta forma:
 
@@ -291,12 +316,12 @@ Para "Opción múltiple": incluí 3–5 "opciones" y la correcta en "respuesta".
 Para "Desarrollo": "opciones" debe ser [], y completá "puntos_clave" con 3–6 ideas que permitan evaluar sin literalidad.
 """
 
-            refs_txt = ""
-            if st.session_state.refs:
-                lines = [f"- {r['titulo']} — {r['autores']}".strip() for r in st.session_state.refs]
-                refs_txt = "Referencias adicionales:\n" + "\n".join(lines)
+                refs_txt = ""
+                if st.session_state.refs:
+                    lines = [f"- {r['titulo']} — {r['autores']}".strip() for r in st.session_state.refs]
+                    refs_txt = "Referencias adicionales:\n" + "\n".join(lines)
 
-            user_prompt = f"""
+                user_prompt = f"""
 Texto base del alumno:
 ---
 {corpus[:15000]}
@@ -311,23 +336,29 @@ En las preguntas de desarrollo, incluí "puntos_clave".
 Procurá incluir también preguntas que vinculen conceptos del material con las referencias adicionales cuando sea pertinente.
 Devolvé JSON puro (sin comentarios ni texto extra).
 """
-            with st.spinner("Generando preguntas..."):
-                try:
-                    content = call_openrouter(
-                        [
-                            {"role": "system", "content": sys_prompt},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        max_tokens=2000,
-                    )
-                    questions = json.loads(content)
-                    assert isinstance(questions, list) and all("pregunta" in q for q in questions)
-                    st.session_state.questions = questions
-                    st.session_state.answers = {}
-                    st.session_state.checked = {}
-                    st.success("✅ Preguntas listas")
-                except Exception as e:
-                    st.error(f"No se pudieron generar preguntas. Detalle: {e}")
+                with st.spinner("Generando preguntas..."):
+                    try:
+                        content = call_openrouter(
+                            [
+                                {"role": "system", "content": sys_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            max_tokens=2000,
+                        )
+                        questions = json.loads(content)
+                        assert isinstance(questions, list) and all("pregunta" in q for q in questions)
+                        st.session_state.questions = questions
+                        st.session_state.answers = {}
+                        st.session_state.checked = {}
+                        # ✔️ Actualizamos el uso solo si se generó OK
+                        st.session_state.questions_used += int(q_count)
+                        st.success("✅ Preguntas listas")
+                    except Exception as e:
+                        msg = str(e)
+                        if "429" in msg:
+                            st.error("⚠️ Límite de uso de la API (429). Reducí la cantidad o intentá más tarde.")
+                        else:
+                            st.error(f"No se pudieron generar preguntas. Detalle: {e}")
 
 with col2:
     if st.button("🧹 Borrar todo"):
@@ -373,7 +404,7 @@ if st.session_state.questions:
                     st.error(f"❌ Incorrecto. Correcta: {q.get('respuesta','')}. {q.get('explicacion','')}")
                     wrong_count += 1
             else:
-                # ====== Evaluación de desarrollo (más flexible y coherente con el slider) ======
+                # ====== Evaluación de desarrollo ======
                 gold = (q.get('respuesta','') or '').strip()
                 puntos = q.get('puntos_clave', []) or []
                 user = (st.session_state.answers.get(i) or '').strip()
@@ -381,7 +412,6 @@ if st.session_state.questions:
                 gold_norm = normalize_text(gold)
                 user_norm = normalize_text(user)
 
-                # umbral único (aplica a todo)
                 thr = int(threshold) if lenient else 85
 
                 passed = False
@@ -390,7 +420,7 @@ if st.session_state.questions:
                 diag_rows = []
                 missing = []
 
-                # 1) Atajos: igualdad o contención
+                # 1) Igualdad/contención
                 if gold_norm and user_norm:
                     if gold_norm == user_norm:
                         passed = True
@@ -399,7 +429,7 @@ if st.session_state.questions:
                         passed = True
                         details.append("Contención directa entre respuesta y solución.")
 
-                # 2) Cobertura de puntos clave (usa thr)
+                # 2) Cobertura de puntos clave
                 coverage = 0
                 covered = 0
                 if not passed and puntos:
@@ -424,7 +454,6 @@ if st.session_state.questions:
 
                     coverage = 100 * covered / max(1, len(puntos))
                     details.append(f"Cobertura de puntos clave: {coverage:.0f}% ({covered}/{len(puntos)})")
-
                     if coverage >= thr:
                         passed = True
                     elif coverage >= max(40, thr - 20):
@@ -433,7 +462,7 @@ if st.session_state.questions:
                         if missing:
                             details.append("Puntos a reforzar: " + "; ".join(missing[:5]))
 
-                # 3) Similitud global (usa thr)
+                # 3) Similitud global
                 if not passed and fuzz is not None and gold_norm and user_norm and lenient:
                     sim_global = fuzz.token_set_ratio(user_norm, gold_norm)
                     details.append(f"Similitud global (token-set): {sim_global}%")
@@ -442,7 +471,7 @@ if st.session_state.questions:
                     elif sim_global >= max(40, thr - 10):
                         partial = True
 
-                # 4) Jaccard de palabras de contenido (usa thr)
+                # 4) Jaccard de contenido
                 if not passed and gold_norm and user_norm:
                     def content_words(s):
                         return {w for w in s.split() if len(w) >= 3}
@@ -457,7 +486,6 @@ if st.session_state.questions:
                     elif jacc >= max(40, thr - 10):
                         partial = True
 
-                # Veredicto
                 if passed:
                     st.success("✅ Correcto (corrección flexible)")
                     score += 1
@@ -509,7 +537,7 @@ if st.session_state.questions:
                 st.info("💪 Buen trabajo. Reforzá los conceptos con menor cobertura y hacé un repaso focalizado.")
             else:
                 st.warning("🚀 Vas en camino. Repasá los puntos clave marcados como faltantes y practicá 3–5 preguntas adicionales.")
-            if missed_points:
+            if 'missed_points' in locals() and missed_points:
                 uniq = {}
                 for p in missed_points:
                     if p and p.strip():
@@ -520,7 +548,7 @@ if st.session_state.questions:
                         st.write(f"• {k}")
 
         # Repasar errores (respeta tipo y usa q_count)
-        if missed_points:
+        if 'missed_points' in locals() and missed_points:
             if st.button("🔄 Repasar errores"):
                 missed_text = "\n".join(f"- {p}" for p in sorted(set(missed_points)))
                 sys_prompt_repaso = """
