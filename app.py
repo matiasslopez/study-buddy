@@ -4,7 +4,6 @@ import time
 import re
 import unicodedata
 import string
-import requests  # opcional
 import httpx
 import streamlit as st
 from dotenv import load_dotenv
@@ -26,14 +25,7 @@ OPENROUTER_API_KEY = (
 )
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "openai/gpt-4o-mini"
-
-# Modelos alternativos si el default devuelve 401
-MODEL_CANDIDATES = [
-    DEFAULT_MODEL,
-    "anthropic/claude-3-haiku",
-    "google/gemini-1.5-flash",
-]
+DEFAULT_MODEL = "openai/gpt-4o-mini"  # se usa como preferencia inicial si está disponible
 
 st.set_page_config(
     page_title="📘 Study Buddy - Entrenador de parciales",
@@ -73,31 +65,73 @@ def get_openrouter_headers():
     h["X-Title"] = "Study Buddy"
     return h
 
-# ==== Health check & guía ====
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_available_models(headers: dict) -> list[str]:
+    """Devuelve la lista de IDs de modelos visibles para tu API key (cacheada 30 min)."""
+    try:
+        with httpx.Client(http2=False, timeout=20.0) as c:
+            r = c.get("https://openrouter.ai/api/v1/models", headers=headers)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return [m.get("id") for m in (data.get("data") or []) if m.get("id")]
+    except Exception:
+        return []
+
+def prefer(candidates: list[str], pool: list[str]) -> list[str]:
+    """Devuelve los candidates que existen en pool, en el mismo orden."""
+    s = set(pool)
+    return [m for m in candidates if m in s]
+
+# ====== Estado global ======
+if "refs" not in st.session_state:
+    st.session_state.refs = []
+if "ref_title" not in st.session_state:
+    st.session_state.ref_title = ""
+if "ref_authors" not in st.session_state:
+    st.session_state.ref_authors = ""
+if "questions" not in st.session_state:
+    st.session_state.questions = None
+    st.session_state.answers = {}
+    st.session_state.checked = {}
+if "selected_model" not in st.session_state:
+    st.session_state.selected_model = None
+
+# ====== Health check & guía ======
 with st.expander("⚙️ Estado de configuración (debug)", expanded=False):
     st.write("🔑 API key cargada:", "✅ Sí" if OPENROUTER_API_KEY else "❌ No")
     st.write("🤖 Modelo por defecto:", DEFAULT_MODEL)
     st.write("📊 Límite diario de preguntas:", MAX_QUESTIONS_PER_DAY)
 
-with st.expander("🧪 Probar /models (debug)", expanded=False):
-    if st.button("Probar /models"):
-        try:
-            with httpx.Client(http2=False, timeout=20.0) as c:
-                r = c.get("https://openrouter.ai/api/v1/models", headers=get_openrouter_headers())
-            st.write("HTTP status:", r.status_code)
-            if r.status_code == 200:
-                data = r.json()
-                names = [m.get("id") for m in (data.get("data") or [])][:10]
-                st.write("Primeros modelos visibles:", names)
-                st.write("¿Está tu modelo por defecto?", DEFAULT_MODEL in names)
-                if DEFAULT_MODEL not in names:
-                    st.warning("Tu modelo por defecto no figura en /models. Se usará fallback automático si falla.")
-            elif r.status_code == 401:
-                st.error("401 Unauthorized en /models: revisá la API key en Secrets.")
-            else:
-                st.write("Texto:", r.text[:800])
-        except Exception as e:
-            st.error(f"No se pudo consultar /models: {e}")
+with st.expander("🧪 Modelos disponibles (debug)", expanded=False):
+    headers_tmp = get_openrouter_headers()
+    models = fetch_available_models(headers_tmp)
+    if not models:
+        st.error("No pude listar modelos (¿401 en /models?). Revisá tu API key en Secrets.")
+    else:
+        st.success(f"Modelos visibles: {len(models)}")
+        st.write("Ejemplos:", models[:10])
+
+        suggested = [
+            "openai/gpt-4o-mini",
+            "anthropic/claude-3-haiku",
+            "google/gemini-1.5-flash",
+            "meta-llama/llama-3.1-8b-instruct",
+            "qwen/qwen-2.5-7b-instruct",
+            "mistralai/mistral-7b-instruct",
+        ]
+        usable_suggested = prefer(suggested, models) or models
+
+        st.markdown("**Elegí un modelo para usar en la app:**")
+        chosen = st.selectbox(
+            "Modelo",
+            usable_suggested,
+            index=0,
+            key="model_picker",
+            help="Se guarda en esta sesión y se usará como preferido al generar preguntas."
+        )
+        st.session_state.selected_model = chosen
+        st.info(f"Modelo seleccionado: **{st.session_state.selected_model}**")
 
 with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
     st.markdown(
@@ -128,9 +162,9 @@ if st.session_state.usage_date != today_str:
     st.session_state.usage_date = today_str
     st.session_state.questions_used = 0
 
-# ====== Cliente OpenRouter con fallback ======
+# ====== Cliente OpenRouter con fallback dinámico ======
 def call_openrouter(messages, max_tokens=800, temperature=0.6):
-    """Intenta con el modelo por defecto; si recibe 401, prueba alternativos."""
+    """Usa el modelo elegido; si 401, prueba con otros modelos disponibles (no fijos)."""
     if not OPENROUTER_API_KEY:
         raise RuntimeError(
             "No se encontró OPENROUTER_API_KEY. Cargá el secreto en Streamlit Cloud (⋮ → Settings → Secrets) "
@@ -138,10 +172,30 @@ def call_openrouter(messages, max_tokens=800, temperature=0.6):
         )
 
     headers = get_openrouter_headers()
+    available = fetch_available_models(headers)
+    if not available:
+        raise RuntimeError("No pude listar modelos disponibles con tu API key (401/403).")
+
+    preferred = st.session_state.get("selected_model") or DEFAULT_MODEL
+    suggested = [
+        "openai/gpt-4o-mini",
+        "anthropic/claude-3-haiku",
+        "google/gemini-1.5-flash",
+        "meta-llama/llama-3.1-8b-instruct",
+        "qwen/qwen-2.5-7b-instruct",
+        "mistralai/mistral-7b-instruct",
+    ]
+
+    candidates = []
+    if preferred in available:
+        candidates.append(preferred)
+    candidates += [m for m in prefer(suggested, available) if m not in candidates]
+    candidates += [m for m in available if m not in candidates]
+
     backoff = [0.5, 1.0, 2.0, 4.0]
     last_err = None
 
-    for mdl in MODEL_CANDIDATES:
+    for mdl in candidates:
         body = {
             "model": mdl,
             "messages": messages,
@@ -154,11 +208,11 @@ def call_openrouter(messages, max_tokens=800, temperature=0.6):
                     r = client.post(OPENROUTER_URL, headers=headers, json=body)
                     if r.status_code == 401:
                         last_err = RuntimeError(f"401 con modelo {mdl}")
-                        break  # probá siguiente modelo
+                        break  # probamos siguiente modelo
                     r.raise_for_status()
                     data = r.json()
-                    if mdl != DEFAULT_MODEL:
-                        st.info(f"ℹ️ Cambié automáticamente al modelo: **{mdl}** (el predeterminado no estaba disponible).")
+                    if mdl != preferred:
+                        st.info(f"ℹ️ Usé el modelo: **{mdl}** (el preferido no estaba disponible).")
                     return data["choices"][0]["message"]["content"]
             except Exception as e:
                 last_err = e
@@ -166,9 +220,8 @@ def call_openrouter(messages, max_tokens=800, temperature=0.6):
                     time.sleep(sleep_s)
                 else:
                     break
-        # intenta con el próximo modelo
 
-    raise RuntimeError(f"Fallo tras reintentos y modelos alternativos: {last_err}")
+    raise RuntimeError(f"Fallo tras reintentos con modelos disponibles: {last_err}")
 
 # -------- File loaders --------
 @st.cache_data(show_spinner=False)
@@ -222,18 +275,6 @@ def best_snippet_similarity(haystack: str, needle: str):
     snippet = (haystack[:140] + "…") if len(haystack) > 140 else haystack
     return sim, snippet
 
-# ====== State ======
-if "refs" not in st.session_state:
-    st.session_state.refs = []
-if "ref_title" not in st.session_state:
-    st.session_state.ref_title = ""
-if "ref_authors" not in st.session_state:
-    st.session_state.ref_authors = ""
-if "questions" not in st.session_state:
-    st.session_state.questions = None
-    st.session_state.answers = {}
-    st.session_state.checked = {}
-
 # ====== Sidebar ======
 with st.sidebar:
     st.header("⚙️ Opciones")
@@ -281,8 +322,10 @@ with st.sidebar:
     threshold = st.slider("Umbral de aceptación (%)", 50, 95, 70) if lenient else 0
     show_diag = st.checkbox("Mostrar diagnóstico detallado", value=True)
 
-    # Mostrar uso diario en la sidebar
+    # Mostrar uso diario y modelo activo en la sidebar
     st.caption(f"📊 Uso diario: {st.session_state.questions_used}/{MAX_QUESTIONS_PER_DAY} preguntas")
+    active_model = st.session_state.get("selected_model") or DEFAULT_MODEL
+    st.caption(f"🤖 Modelo activo: {active_model}")
 
 # ====== Uploader ======
 st.markdown(
@@ -343,7 +386,7 @@ def enrich_with_wikipedia(text: str, max_terms: int = 3) -> str:
             extras.append(f"### {term}\n{s}")
     return "\n\n".join(extras)
 
-# ====== Generate Questions ======
+# ====== Generación de preguntas ======
 col1, col2 = st.columns([1, 1])
 with col1:
     if st.button("🧪 Generar preguntas"):
@@ -421,8 +464,8 @@ Devolvé JSON puro (sin comentarios ni texto extra).
                     except Exception as e:
                         msg = str(e)
                         if "401" in msg:
-                            st.error("🔐 401 Unauthorized: el modelo por defecto no está habilitado o la key está mal. "
-                                     "Probá nuevamente (se intentan modelos alternativos) o revisá Secrets.")
+                            st.error("🔐 401 Unauthorized: el modelo preferido no está habilitado. "
+                                     "Probá elegir otro en 'Modelos disponibles (debug)'.")
                         elif "429" in msg:
                             st.error("⚠️ Límite de uso de la API (429). Reducí la cantidad o intentá más tarde.")
                         else:
@@ -436,6 +479,9 @@ with col2:
         st.rerun()
 
 # ====== Render Quiz ======
+def normalize_for_eval(text: str) -> str:
+    return normalize_text(text)
+
 if st.session_state.questions:
     st.subheader("📚 Preguntas")
     questions = st.session_state.questions
@@ -477,8 +523,8 @@ if st.session_state.questions:
                 puntos = q.get('puntos_clave', []) or []
                 user = (st.session_state.answers.get(i) or '').strip()
 
-                gold_norm = normalize_text(gold)
-                user_norm = normalize_text(user)
+                gold_norm = normalize_for_eval(gold)
+                user_norm = normalize_for_eval(user)
 
                 thr = int(threshold) if lenient else 85
 
@@ -502,7 +548,7 @@ if st.session_state.questions:
                 covered = 0
                 if not passed and puntos:
                     for p in puntos:
-                        p_norm = normalize_text(p)
+                        p_norm = normalize_for_eval(p)
                         hit = False
                         sim = 0
                         snippet = ""
@@ -674,7 +720,7 @@ st.markdown(
 
 # ---- Footer ----
 st.markdown("<hr/>", unsafe_allow_html=True)
-st.caption("Motor de IA: OpenRouter (podés cambiar el modelo en el código)")
+st.caption("Motor de IA: OpenRouter (podés cambiar el modelo en la sección de modelos disponibles)")
 
 # Footer con versión dinámica
 version_str = datetime.now().strftime("%Y%m%d%H%M")
