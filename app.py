@@ -65,6 +65,31 @@ with st.expander("⚙️ Estado de configuración (debug)", expanded=False):
     st.write("🔑 API key cargada:", "✅ Sí" if OPENROUTER_API_KEY else "❌ No")
     st.write("🤖 Modelo en uso:", DEFAULT_MODEL)
     st.write("📊 Límite diario de preguntas:", MAX_QUESTIONS_PER_DAY)
+import httpx
+
+with st.expander("🧪 Probar conexión a OpenRouter (debug)", expanded=False):
+    if st.button("Probar /models"):
+        try:
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}" if OPENROUTER_API_KEY else "",
+                "Content-Type": "application/json",
+            }
+            with httpx.Client(http2=False, timeout=20.0) as c:
+                r = c.get("https://openrouter.ai/api/v1/models", headers=headers)
+            st.write("HTTP status:", r.status_code)
+            # Mostramos un resumen seguro (sin datos sensibles)
+            try:
+                data = r.json()
+                names = [m.get("id") for m in (data.get("data") or [])][:5]
+                st.write("Primeros modelos visibles:", names)
+            except Exception:
+                st.write("Respuesta texto:", r.text[:500])
+            if r.status_code == 401:
+                st.error("401 Unauthorized: la API key no se está leyendo bien o fue revocada.")
+            elif r.status_code == 200:
+                st.success("✅ Conexión OK: la API key es válida.")
+        except Exception as e:
+            st.error(f"Error de conexión: {e}")
 
 # ==== Guía breve de uso (plegada por defecto) ====
 with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
@@ -639,3 +664,13 @@ st.markdown(
 # ---- Footer ----
 st.markdown("<hr/>", unsafe_allow_html=True)
 st.caption("Motor de IA: OpenRouter (podés cambiar el modelo en el código)")
+from datetime import datetime
+
+# Footer con versión dinámica
+version_str = datetime.now().strftime("%Y%m%d%H%M")
+st.markdown(
+    f"<p style='text-align: center; font-size: 12px; color: gray;'>"
+    f"Proyecto creado por MSL, versión {version_str}"
+    f"</p>",
+    unsafe_allow_html=True
+)
