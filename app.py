@@ -19,7 +19,7 @@ except Exception:
 # ====== Config ======
 load_dotenv()
 
-# Leer API key de Secrets (Cloud) o .env (local)
+# API key desde Secrets (Cloud) o .env (local)
 OPENROUTER_API_KEY = (
     st.secrets.get("OPENROUTER_API_KEY")
     or os.getenv("OPENROUTER_API_KEY")
@@ -28,11 +28,12 @@ OPENROUTER_API_KEY = (
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 
-# Headers extra recomendados (no obligatorios) por OpenRouter
-OPENROUTER_HEADERS_EXTRA = {
-    "HTTP-Referer": st.secrets.get("APP_URL", ""),  # opcional
-    "X-Title": "Study Buddy",
-}
+# Modelos alternativos si el default devuelve 401
+MODEL_CANDIDATES = [
+    DEFAULT_MODEL,
+    "anthropic/claude-3-haiku",
+    "google/gemini-1.5-flash",
+]
 
 st.set_page_config(
     page_title="📘 Study Buddy - Entrenador de parciales",
@@ -47,51 +48,57 @@ st.caption(
     "en una presentación o examen. Subí material (TXT/PDF/DOCX), generá preguntas y recibí feedback con corrección flexible."
 )
 
-# ====== Util: enteros seguros ======
+# ====== Utils ======
 def _get_int(value, default):
     try:
         return int(str(value).strip())
     except Exception:
         return default
 
-# ====== Límite diario configurable por Secrets/entorno ======
+# Límite diario configurable por Secrets/entorno
 MAX_QUESTIONS_PER_DAY = _get_int(
     st.secrets.get("MAX_QUESTIONS_PER_DAY", os.getenv("MAX_QUESTIONS_PER_DAY", 60)),
     60
 )
 
-# === Health check section (debug) ===
+# Headers de OpenRouter (agrega extras SOLO si tienen valor)
+def get_openrouter_headers():
+    h = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}" if OPENROUTER_API_KEY else "",
+        "Content-Type": "application/json",
+    }
+    ref = (st.secrets.get("APP_URL") or "").strip()
+    if ref:
+        h["HTTP-Referer"] = ref
+    h["X-Title"] = "Study Buddy"
+    return h
+
+# ==== Health check & guía ====
 with st.expander("⚙️ Estado de configuración (debug)", expanded=False):
     st.write("🔑 API key cargada:", "✅ Sí" if OPENROUTER_API_KEY else "❌ No")
-    st.write("🤖 Modelo en uso:", DEFAULT_MODEL)
+    st.write("🤖 Modelo por defecto:", DEFAULT_MODEL)
     st.write("📊 Límite diario de preguntas:", MAX_QUESTIONS_PER_DAY)
-import httpx
 
-with st.expander("🧪 Probar conexión a OpenRouter (debug)", expanded=False):
+with st.expander("🧪 Probar /models (debug)", expanded=False):
     if st.button("Probar /models"):
         try:
-            headers = {
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}" if OPENROUTER_API_KEY else "",
-                "Content-Type": "application/json",
-            }
             with httpx.Client(http2=False, timeout=20.0) as c:
-                r = c.get("https://openrouter.ai/api/v1/models", headers=headers)
+                r = c.get("https://openrouter.ai/api/v1/models", headers=get_openrouter_headers())
             st.write("HTTP status:", r.status_code)
-            # Mostramos un resumen seguro (sin datos sensibles)
-            try:
+            if r.status_code == 200:
                 data = r.json()
-                names = [m.get("id") for m in (data.get("data") or [])][:5]
+                names = [m.get("id") for m in (data.get("data") or [])][:10]
                 st.write("Primeros modelos visibles:", names)
-            except Exception:
-                st.write("Respuesta texto:", r.text[:500])
-            if r.status_code == 401:
-                st.error("401 Unauthorized: la API key no se está leyendo bien o fue revocada.")
-            elif r.status_code == 200:
-                st.success("✅ Conexión OK: la API key es válida.")
+                st.write("¿Está tu modelo por defecto?", DEFAULT_MODEL in names)
+                if DEFAULT_MODEL not in names:
+                    st.warning("Tu modelo por defecto no figura en /models. Se usará fallback automático si falla.")
+            elif r.status_code == 401:
+                st.error("401 Unauthorized en /models: revisá la API key en Secrets.")
+            else:
+                st.write("Texto:", r.text[:800])
         except Exception as e:
-            st.error(f"Error de conexión: {e}")
+            st.error(f"No se pudo consultar /models: {e}")
 
-# ==== Guía breve de uso (plegada por defecto) ====
 with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
     st.markdown(
         """
@@ -121,44 +128,47 @@ if st.session_state.usage_date != today_str:
     st.session_state.usage_date = today_str
     st.session_state.questions_used = 0
 
-# ====== Helpers ======
-def call_openrouter(messages, max_tokens=800, temperature=0.6, model=DEFAULT_MODEL):
-    """Cliente robusto con httpx, HTTP/1.1 y reintentos para evitar errores TLS."""
+# ====== Cliente OpenRouter con fallback ======
+def call_openrouter(messages, max_tokens=800, temperature=0.6):
+    """Intenta con el modelo por defecto; si recibe 401, prueba alternativos."""
     if not OPENROUTER_API_KEY:
         raise RuntimeError(
-            "No se encontró OPENROUTER_API_KEY. "
-            "Cargá el secreto en Streamlit Cloud (⋮ → Settings → Secrets) o definilo en tu .env local."
+            "No se encontró OPENROUTER_API_KEY. Cargá el secreto en Streamlit Cloud (⋮ → Settings → Secrets) "
+            "o definilo en tu .env local."
         )
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        **OPENROUTER_HEADERS_EXTRA,
-    }
-    body = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-
+    headers = get_openrouter_headers()
     backoff = [0.5, 1.0, 2.0, 4.0]
     last_err = None
-    for sleep_s in backoff + [0]:
-        try:
-            with httpx.Client(http2=False, timeout=60.0, verify=True) as client:
-                r = client.post(OPENROUTER_URL, headers=headers, json=body)
-                r.raise_for_status()
-                data = r.json()
-                return data["choices"][0]["message"]["content"]
-        except Exception as e:
-            last_err = e
-            if sleep_s:
-                time.sleep(sleep_s)
-            else:
-                break
 
-    raise RuntimeError(f"Fallo al llamar a OpenRouter tras reintentos: {last_err}")
+    for mdl in MODEL_CANDIDATES:
+        body = {
+            "model": mdl,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        for sleep_s in backoff + [0]:
+            try:
+                with httpx.Client(http2=False, timeout=60.0, verify=True) as client:
+                    r = client.post(OPENROUTER_URL, headers=headers, json=body)
+                    if r.status_code == 401:
+                        last_err = RuntimeError(f"401 con modelo {mdl}")
+                        break  # probá siguiente modelo
+                    r.raise_for_status()
+                    data = r.json()
+                    if mdl != DEFAULT_MODEL:
+                        st.info(f"ℹ️ Cambié automáticamente al modelo: **{mdl}** (el predeterminado no estaba disponible).")
+                    return data["choices"][0]["message"]["content"]
+            except Exception as e:
+                last_err = e
+                if sleep_s:
+                    time.sleep(sleep_s)
+                else:
+                    break
+        # intenta con el próximo modelo
+
+    raise RuntimeError(f"Fallo tras reintentos y modelos alternativos: {last_err}")
 
 # -------- File loaders --------
 @st.cache_data(show_spinner=False)
@@ -411,7 +421,8 @@ Devolvé JSON puro (sin comentarios ni texto extra).
                     except Exception as e:
                         msg = str(e)
                         if "401" in msg:
-                            st.error("🔐 401 Unauthorized: revisá tu OPENROUTER_API_KEY en Secrets.")
+                            st.error("🔐 401 Unauthorized: el modelo por defecto no está habilitado o la key está mal. "
+                                     "Probá nuevamente (se intentan modelos alternativos) o revisá Secrets.")
                         elif "429" in msg:
                             st.error("⚠️ Límite de uso de la API (429). Reducí la cantidad o intentá más tarde.")
                         else:
@@ -664,7 +675,6 @@ st.markdown(
 # ---- Footer ----
 st.markdown("<hr/>", unsafe_allow_html=True)
 st.caption("Motor de IA: OpenRouter (podés cambiar el modelo en el código)")
-from datetime import datetime
 
 # Footer con versión dinámica
 version_str = datetime.now().strftime("%Y%m%d%H%M")
