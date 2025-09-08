@@ -30,8 +30,7 @@ DEFAULT_MODEL = "openai/gpt-4o-mini"
 
 # Headers extra recomendados (no obligatorios) por OpenRouter
 OPENROUTER_HEADERS_EXTRA = {
-    # Si querés, seteá tu URL pública en Secrets como APP_URL
-    "HTTP-Referer": st.secrets.get("APP_URL", ""),
+    "HTTP-Referer": st.secrets.get("APP_URL", ""),  # opcional
     "X-Title": "Study Buddy",
 }
 
@@ -47,6 +46,25 @@ st.caption(
     "Te ayuda a validar tus conocimientos, desafiarte con preguntas y acompañarte para lograr tu mejor performance "
     "en una presentación o examen. Subí material (TXT/PDF/DOCX), generá preguntas y recibí feedback con corrección flexible."
 )
+
+# ====== Util: enteros seguros ======
+def _get_int(value, default):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+# ====== Límite diario configurable por Secrets/entorno ======
+MAX_QUESTIONS_PER_DAY = _get_int(
+    st.secrets.get("MAX_QUESTIONS_PER_DAY", os.getenv("MAX_QUESTIONS_PER_DAY", 60)),
+    60
+)
+
+# === Health check section (debug) ===
+with st.expander("⚙️ Estado de configuración (debug)", expanded=False):
+    st.write("🔑 API key cargada:", "✅ Sí" if OPENROUTER_API_KEY else "❌ No")
+    st.write("🤖 Modelo en uso:", DEFAULT_MODEL)
+    st.write("📊 Límite diario de preguntas:", MAX_QUESTIONS_PER_DAY)
 
 # ==== Guía breve de uso (plegada por defecto) ====
 with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
@@ -67,18 +85,6 @@ with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
 > Tip: si cambiás opciones o bibliografía, podés volver a generar preguntas para una nueva ronda de práctica.
 """
     )
-
-# ====== Límite diario configurable por Secrets/entorno ======
-def _get_int(value, default):
-    try:
-        return int(str(value).strip())
-    except Exception:
-        return default
-
-MAX_QUESTIONS_PER_DAY = _get_int(
-    st.secrets.get("MAX_QUESTIONS_PER_DAY", os.getenv("MAX_QUESTIONS_PER_DAY", 60)),
-    60
-)
 
 # ====== Control de uso diario ======
 today_str = datetime.utcnow().strftime("%Y-%m-%d")
