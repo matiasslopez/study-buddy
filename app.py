@@ -8,6 +8,7 @@ import httpx
 import streamlit as st
 from dotenv import load_dotenv
 from datetime import datetime
+from typing import List, Dict
 
 # Similitud difusa (opcional)
 try:
@@ -18,14 +19,13 @@ except Exception:
 # ====== Config ======
 load_dotenv()
 
-# API key desde Secrets (Cloud) o .env (local)
-OPENROUTER_API_KEY = (
-    st.secrets.get("OPENROUTER_API_KEY")
-    or os.getenv("OPENROUTER_API_KEY")
-)
+# Claves
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "openai/gpt-4o-mini"  # se usa como preferencia inicial si está disponible
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"  # recomendado (económico y bueno)
+DEFAULT_OR_MODEL = "anthropic/claude-3-haiku"  # fallback razonable en OpenRouter
 
 st.set_page_config(
     page_title="📘 Study Buddy - Entrenador de parciales",
@@ -55,33 +55,16 @@ MAX_QUESTIONS_PER_DAY = _get_int(
 
 # Headers de OpenRouter (agrega extras SOLO si tienen valor)
 def get_openrouter_headers():
+    ref = (st.secrets.get("APP_URL") or "").strip()
     h = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}" if OPENROUTER_API_KEY else "",
         "Content-Type": "application/json",
+        "X-Title": "Study Buddy",
     }
-    ref = (st.secrets.get("APP_URL") or "").strip()
     if ref:
         h["HTTP-Referer"] = ref
-    h["X-Title"] = "Study Buddy"
+        h["Origin"] = ref
     return h
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_available_models(headers: dict) -> list[str]:
-    """Devuelve la lista de IDs de modelos visibles para tu API key (cacheada 30 min)."""
-    try:
-        with httpx.Client(http2=False, timeout=20.0) as c:
-            r = c.get("https://openrouter.ai/api/v1/models", headers=headers)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        return [m.get("id") for m in (data.get("data") or []) if m.get("id")]
-    except Exception:
-        return []
-
-def prefer(candidates: list[str], pool: list[str]) -> list[str]:
-    """Devuelve los candidates que existen en pool, en el mismo orden."""
-    s = set(pool)
-    return [m for m in candidates if m in s]
 
 # ====== Estado global ======
 if "refs" not in st.session_state:
@@ -94,44 +77,22 @@ if "questions" not in st.session_state:
     st.session_state.questions = None
     st.session_state.answers = {}
     st.session_state.checked = {}
-if "selected_model" not in st.session_state:
-    st.session_state.selected_model = None
+if "usage_date" not in st.session_state:
+    st.session_state.usage_date = datetime.utcnow().strftime("%Y-%m-%d")
+if "questions_used" not in st.session_state:
+    st.session_state.questions_used = 0
 
-# ====== Health check & guía ======
+# Reset diario
+today_str = datetime.utcnow().strftime("%Y-%m-%d")
+if st.session_state.usage_date != today_str:
+    st.session_state.usage_date = today_str
+    st.session_state.questions_used = 0
+
+# ====== Health & guía ======
 with st.expander("⚙️ Estado de configuración (debug)", expanded=False):
-    st.write("🔑 API key cargada:", "✅ Sí" if OPENROUTER_API_KEY else "❌ No")
-    st.write("🤖 Modelo por defecto:", DEFAULT_MODEL)
+    st.write("🔑 OPENAI_API_KEY:", "✅ Sí" if OPENAI_API_KEY else "❌ No")
+    st.write("🔑 OPENROUTER_API_KEY:", "✅ Sí" if OPENROUTER_API_KEY else "❌ No")
     st.write("📊 Límite diario de preguntas:", MAX_QUESTIONS_PER_DAY)
-
-with st.expander("🧪 Modelos disponibles (debug)", expanded=False):
-    headers_tmp = get_openrouter_headers()
-    models = fetch_available_models(headers_tmp)
-    if not models:
-        st.error("No pude listar modelos (¿401 en /models?). Revisá tu API key en Secrets.")
-    else:
-        st.success(f"Modelos visibles: {len(models)}")
-        st.write("Ejemplos:", models[:10])
-
-        suggested = [
-            "openai/gpt-4o-mini",
-            "anthropic/claude-3-haiku",
-            "google/gemini-1.5-flash",
-            "meta-llama/llama-3.1-8b-instruct",
-            "qwen/qwen-2.5-7b-instruct",
-            "mistralai/mistral-7b-instruct",
-        ]
-        usable_suggested = prefer(suggested, models) or models
-
-        st.markdown("**Elegí un modelo para usar en la app:**")
-        chosen = st.selectbox(
-            "Modelo",
-            usable_suggested,
-            index=0,
-            key="model_picker",
-            help="Se guarda en esta sesión y se usará como preferido al generar preguntas."
-        )
-        st.session_state.selected_model = chosen
-        st.info(f"Modelo seleccionado: **{st.session_state.selected_model}**")
 
 with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
     st.markdown(
@@ -152,76 +113,58 @@ with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
 """
     )
 
-# ====== Control de uso diario ======
-today_str = datetime.utcnow().strftime("%Y-%m-%d")
-if "usage_date" not in st.session_state:
-    st.session_state.usage_date = today_str
-if "questions_used" not in st.session_state:
-    st.session_state.questions_used = 0
-if st.session_state.usage_date != today_str:
-    st.session_state.usage_date = today_str
-    st.session_state.questions_used = 0
+# ====== Cliente LLM unificado: OpenAI (default) y OpenRouter (opcional) ======
+def call_llm(messages: List[Dict[str, str]], max_tokens=800, temperature=0.6, provider="OpenAI"):
+    """
+    Llama al proveedor seleccionado:
+    - OpenAI (recomendado)
+    - OpenRouter (opcional)
+    """
+    if provider == "OpenAI":
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OpenAI error: falta OPENAI_API_KEY (Secrets/.env).")
+        # SDK oficial OpenAI
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            resp = client.chat.completions.create(
+                model=DEFAULT_OPENAI_MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            raise RuntimeError(f"OpenAI error: {e}")
 
-# ====== Cliente OpenRouter con fallback dinámico ======
-def call_openrouter(messages, max_tokens=800, temperature=0.6):
-    """Usa el modelo elegido; si 401, prueba con otros modelos disponibles (no fijos)."""
+    # ---- OpenRouter (backup) ----
     if not OPENROUTER_API_KEY:
-        raise RuntimeError(
-            "No se encontró OPENROUTER_API_KEY. Cargá el secreto en Streamlit Cloud (⋮ → Settings → Secrets) "
-            "o definilo en tu .env local."
-        )
-
+        raise RuntimeError("OpenRouter error: falta OPENROUTER_API_KEY para usar este proveedor.")
     headers = get_openrouter_headers()
-    available = fetch_available_models(headers)
-    if not available:
-        raise RuntimeError("No pude listar modelos disponibles con tu API key (401/403).")
-
-    preferred = st.session_state.get("selected_model") or DEFAULT_MODEL
-    suggested = [
-        "openai/gpt-4o-mini",
-        "anthropic/claude-3-haiku",
-        "google/gemini-1.5-flash",
-        "meta-llama/llama-3.1-8b-instruct",
-        "qwen/qwen-2.5-7b-instruct",
-        "mistralai/mistral-7b-instruct",
-    ]
-
-    candidates = []
-    if preferred in available:
-        candidates.append(preferred)
-    candidates += [m for m in prefer(suggested, available) if m not in candidates]
-    candidates += [m for m in available if m not in candidates]
-
-    backoff = [0.5, 1.0, 2.0, 4.0]
+    body = {
+        "model": DEFAULT_OR_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    backoff = [0.5, 1.0, 2.0]
     last_err = None
-
-    for mdl in candidates:
-        body = {
-            "model": mdl,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        for sleep_s in backoff + [0]:
-            try:
-                with httpx.Client(http2=False, timeout=60.0, verify=True) as client:
-                    r = client.post(OPENROUTER_URL, headers=headers, json=body)
-                    if r.status_code == 401:
-                        last_err = RuntimeError(f"401 con modelo {mdl}")
-                        break  # probamos siguiente modelo
-                    r.raise_for_status()
-                    data = r.json()
-                    if mdl != preferred:
-                        st.info(f"ℹ️ Usé el modelo: **{mdl}** (el preferido no estaba disponible).")
-                    return data["choices"][0]["message"]["content"]
-            except Exception as e:
-                last_err = e
-                if sleep_s:
-                    time.sleep(sleep_s)
-                else:
-                    break
-
-    raise RuntimeError(f"Fallo tras reintentos con modelos disponibles: {last_err}")
+    for s in backoff + [0]:
+        try:
+            with httpx.Client(http2=False, timeout=60.0, verify=True) as c:
+                r = c.post(OPENROUTER_URL, headers=headers, json=body)
+            if r.status_code == 401:
+                raise RuntimeError("OpenRouter error: 401 Unauthorized (modelo/clave/origen).")
+            r.raise_for_status()
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            last_err = e
+            if s:
+                time.sleep(s)
+            else:
+                break
+    raise RuntimeError(f"OpenRouter error: {last_err}")
 
 # -------- File loaders --------
 @st.cache_data(show_spinner=False)
@@ -279,6 +222,10 @@ def best_snippet_similarity(haystack: str, needle: str):
 with st.sidebar:
     st.header("⚙️ Opciones")
 
+    # Proveedor
+    st.subheader("Proveedor de IA")
+    provider = st.radio("Elegí proveedor", ["OpenAI", "OpenRouter"], index=0, help="OpenAI recomendado")
+
     q_count = st.selectbox("Cantidad de preguntas", list(range(1, 21)), index=4)
     difficulty = st.selectbox("Dificultad", ["Fácil", "Media", "Difícil"], index=0)
     q_type = st.selectbox("Tipo de pregunta", ["Opción múltiple", "Desarrollo"])
@@ -322,10 +269,9 @@ with st.sidebar:
     threshold = st.slider("Umbral de aceptación (%)", 50, 95, 70) if lenient else 0
     show_diag = st.checkbox("Mostrar diagnóstico detallado", value=True)
 
-    # Mostrar uso diario y modelo activo en la sidebar
+    # Mostrar uso diario y proveedor
     st.caption(f"📊 Uso diario: {st.session_state.questions_used}/{MAX_QUESTIONS_PER_DAY} preguntas")
-    active_model = st.session_state.get("selected_model") or DEFAULT_MODEL
-    st.caption(f"🤖 Modelo activo: {active_model}")
+    st.caption(f"🧠 Proveedor activo: {provider}")
 
 # ====== Uploader ======
 st.markdown(
@@ -447,12 +393,13 @@ Devolvé JSON puro (sin comentarios ni texto extra).
 """
                 with st.spinner("Generando preguntas..."):
                     try:
-                        content = call_openrouter(
+                        content = call_llm(
                             [
                                 {"role": "system", "content": sys_prompt},
                                 {"role": "user", "content": user_prompt},
                             ],
                             max_tokens=2000,
+                            provider=provider,
                         )
                         questions = json.loads(content)
                         assert isinstance(questions, list) and all("pregunta" in q for q in questions)
@@ -463,13 +410,12 @@ Devolvé JSON puro (sin comentarios ni texto extra).
                         st.success("✅ Preguntas listas")
                     except Exception as e:
                         msg = str(e)
-                        if "401" in msg:
-                            st.error("🔐 401 Unauthorized: el modelo preferido no está habilitado. "
-                                     "Probá elegir otro en 'Modelos disponibles (debug)'.")
-                        elif "429" in msg:
-                            st.error("⚠️ Límite de uso de la API (429). Reducí la cantidad o intentá más tarde.")
+                        if "OpenAI error" in msg:
+                            st.error(f"❌ {msg}. Verificá tu OPENAI_API_KEY en Secrets y el modelo.")
+                        elif "OpenRouter error" in msg:
+                            st.error(f"❌ {msg}. Si estás usando OpenRouter, revisá clave/modelo/origen.")
                         else:
-                            st.error(f"No se pudieron generar preguntas. Detalle: {e}")
+                            st.error(f"No se pudieron generar preguntas. Detalle: {msg}")
 
 with col2:
     if st.button("🧹 Borrar todo"):
@@ -661,7 +607,7 @@ if st.session_state.questions:
                     for k, _ in sorted(uniq.items(), key=lambda x: x[1], reverse=True)[:8]:
                         st.write(f"• {k}")
 
-        # Repasar errores (respeta tipo y usa q_count)
+        # Repasar errores
         if 'missed_points' in locals() and missed_points:
             if st.button("🔄 Repasar errores"):
                 missed_text = "\n".join(f"- {p}" for p in sorted(set(missed_points)))
@@ -692,12 +638,13 @@ con dificultad {difficulty}, enfocadas específicamente en estos puntos débiles
 Devolvé JSON puro (sin texto extra).
 """
                 try:
-                    content = call_openrouter(
+                    content = call_llm(
                         [
                             {"role": "system", "content": sys_prompt_repaso},
                             {"role": "user", "content": repaso_prompt},
                         ],
                         max_tokens=1500,
+                        provider=provider,
                     )
                     new_questions = json.loads(content)
                     assert isinstance(new_questions, list) and all("pregunta" in q for q in new_questions)
@@ -720,7 +667,7 @@ st.markdown(
 
 # ---- Footer ----
 st.markdown("<hr/>", unsafe_allow_html=True)
-st.caption("Motor de IA: OpenRouter (podés cambiar el modelo en la sección de modelos disponibles)")
+st.caption("Motor de IA: OpenAI (con opción OpenRouter como backup)")
 
 # Footer con versión dinámica
 version_str = datetime.now().strftime("%Y%m%d%H%M")
