@@ -1,4 +1,15 @@
-import os
+# ====== Forzar UTF-8 en todo el entorno (Windows-safe) ======
+import sys, os
+try:
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    if hasattr(sys, "stdout"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys, "stderr"):
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+# ============================================================
+
 import json
 import time
 import re
@@ -16,54 +27,61 @@ try:
 except Exception:
     fuzz = None
 
-# ====== Config ======
 load_dotenv()
 
-# Claves
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+# ====== API Keys desde Secrets/.env ======
+OPENAI_API_KEY       = st.secrets.get("OPENAI_API_KEY")       or os.getenv("OPENAI_API_KEY")
+OPENROUTER_API_KEY   = st.secrets.get("OPENROUTER_API_KEY")   or os.getenv("OPENROUTER_API_KEY")
+GROQ_API_KEY         = st.secrets.get("GROQ_API_KEY")         or os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY       = st.secrets.get("GEMINI_API_KEY")       or os.getenv("GEMINI_API_KEY")
+COHERE_API_KEY       = st.secrets.get("COHERE_API_KEY")       or os.getenv("COHERE_API_KEY")
+HUGGINGFACE_API_KEY  = st.secrets.get("HUGGINGFACE_API_KEY")  or os.getenv("HUGGINGFACE_API_KEY")
 
+APP_URL = (st.secrets.get("APP_URL") or os.getenv("APP_URL") or "").strip()
+
+# ====== Endpoints / Modelos por defecto ======
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_OPENAI_MODEL = "gpt-4o-mini"  # recomendado (económico y bueno)
-DEFAULT_OR_MODEL = "anthropic/claude-3-haiku"  # fallback razonable en OpenRouter
+DEFAULT_OPENAI_MODEL   = "gpt-4o-mini"
+DEFAULT_OR_MODEL       = "anthropic/claude-3-haiku"
+DEFAULT_GROQ_MODEL     = "llama3-8b-8192"          # alias en Groq
+DEFAULT_GEMINI_MODEL   = "gemini-1.5-flash"
+DEFAULT_COHERE_MODEL   = "command-r"
+DEFAULT_HF_MODEL       = "meta-llama/Meta-Llama-3-8B-Instruct"  # requiere token HF
 
+# ====== Layout ======
 st.set_page_config(
     page_title="📘 Study Buddy - Entrenador de parciales",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
 st.title("📘 Study Buddy — Tu compañero de estudio")
 st.caption(
     "Te ayuda a validar tus conocimientos, desafiarte con preguntas y acompañarte para lograr tu mejor performance "
     "en una presentación o examen. Subí material (TXT/PDF/DOCX), generá preguntas y recibí feedback con corrección flexible."
 )
 
-# ====== Utils ======
+# ====== Helpers ======
 def _get_int(value, default):
     try:
         return int(str(value).strip())
     except Exception:
         return default
 
-# Límite diario configurable por Secrets/entorno
 MAX_QUESTIONS_PER_DAY = _get_int(
     st.secrets.get("MAX_QUESTIONS_PER_DAY", os.getenv("MAX_QUESTIONS_PER_DAY", 60)),
     60
 )
 
-# Headers de OpenRouter (agrega extras SOLO si tienen valor)
 def get_openrouter_headers():
-    ref = (st.secrets.get("APP_URL") or "").strip()
     h = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}" if OPENROUTER_API_KEY else "",
         "Content-Type": "application/json",
         "X-Title": "Study Buddy",
     }
-    if ref:
-        h["HTTP-Referer"] = ref
-        h["Origin"] = ref
+    if APP_URL:
+        h["HTTP-Referer"] = APP_URL
+        h["Origin"] = APP_URL
     return h
 
 # ====== Estado global ======
@@ -92,6 +110,10 @@ if st.session_state.usage_date != today_str:
 with st.expander("⚙️ Estado de configuración (debug)", expanded=False):
     st.write("🔑 OPENAI_API_KEY:", "✅ Sí" if OPENAI_API_KEY else "❌ No")
     st.write("🔑 OPENROUTER_API_KEY:", "✅ Sí" if OPENROUTER_API_KEY else "❌ No")
+    st.write("🔑 GROQ_API_KEY:", "✅ Sí" if GROQ_API_KEY else "❌ No")
+    st.write("🔑 GEMINI_API_KEY:", "✅ Sí" if GEMINI_API_KEY else "❌ No")
+    st.write("🔑 COHERE_API_KEY:", "✅ Sí" if COHERE_API_KEY else "❌ No")
+    st.write("🔑 HUGGINGFACE_API_KEY:", "✅ Sí" if HUGGINGFACE_API_KEY else "❌ No")
     st.write("📊 Límite diario de preguntas:", MAX_QUESTIONS_PER_DAY)
 
 with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
@@ -113,20 +135,31 @@ with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
 """
     )
 
-# ====== Cliente LLM unificado: OpenAI (default) y OpenRouter (opcional) ======
+# ====== Cliente LLM multi-proveedor ======
 def call_llm(messages: List[Dict[str, str]], max_tokens=800, temperature=0.6, provider="OpenAI"):
     """
-    Llama al proveedor seleccionado:
-    - OpenAI (recomendado)
-    - OpenRouter (opcional)
+    Proveedores soportados:
+      - OpenAI
+      - OpenRouter
+      - Groq
+      - Gemini
+      - Cohere
+      - Hugging Face
     """
+    # --- OpenAI ---
     if provider == "OpenAI":
         if not OPENAI_API_KEY:
-            raise RuntimeError("OpenAI error: falta OPENAI_API_KEY (Secrets/.env).")
-        # SDK oficial OpenAI
+            raise RuntimeError("OpenAI error: falta OPENAI_API_KEY.")
         try:
             from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_API_KEY)
+            client = OpenAI(
+                api_key=OPENAI_API_KEY,
+                default_headers={
+                    "User-Agent": "StudyBuddy/1.0",
+                    "X-Client-Name": "StudyBuddy",
+                    "X-Client-Version": "1.0",
+                },
+            )
             resp = client.chat.completions.create(
                 model=DEFAULT_OPENAI_MODEL,
                 messages=messages,
@@ -137,19 +170,17 @@ def call_llm(messages: List[Dict[str, str]], max_tokens=800, temperature=0.6, pr
         except Exception as e:
             raise RuntimeError(f"OpenAI error: {e}")
 
-    # ---- OpenRouter (backup) ----
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OpenRouter error: falta OPENROUTER_API_KEY para usar este proveedor.")
-    headers = get_openrouter_headers()
-    body = {
-        "model": DEFAULT_OR_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    backoff = [0.5, 1.0, 2.0]
-    last_err = None
-    for s in backoff + [0]:
+    # --- OpenRouter ---
+    if provider == "OpenRouter":
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("OpenRouter error: falta OPENROUTER_API_KEY.")
+        headers = get_openrouter_headers()
+        body = {
+            "model": DEFAULT_OR_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
         try:
             with httpx.Client(http2=False, timeout=60.0, verify=True) as c:
                 r = c.post(OPENROUTER_URL, headers=headers, json=body)
@@ -159,12 +190,114 @@ def call_llm(messages: List[Dict[str, str]], max_tokens=800, temperature=0.6, pr
             data = r.json()
             return data["choices"][0]["message"]["content"]
         except Exception as e:
-            last_err = e
-            if s:
-                time.sleep(s)
-            else:
-                break
-    raise RuntimeError(f"OpenRouter error: {last_err}")
+            raise RuntimeError(f"OpenRouter error: {e}")
+
+    # --- Groq ---
+    if provider == "Groq":
+        if not GROQ_API_KEY:
+            raise RuntimeError("Groq error: falta GROQ_API_KEY.")
+        try:
+            from groq import Groq
+            client = Groq(api_key=GROQ_API_KEY)
+            r = client.chat.completions.create(
+                model=DEFAULT_GROQ_MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return r.choices[0].message.content
+        except Exception as e:
+            raise RuntimeError(f"Groq error: {e}")
+
+    # --- Gemini (forzar JSON) ---
+    if provider == "Gemini":
+        if not GEMINI_API_KEY:
+            raise RuntimeError("Gemini error: falta GEMINI_API_KEY.")
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=GEMINI_API_KEY)
+
+            model = genai.GenerativeModel(DEFAULT_GEMINI_MODEL)
+            sys_txt = "\n".join([m["content"] for m in messages if m["role"] == "system"])
+            usr_txt = "\n".join([m["content"] for m in messages if m["role"] == "user"])
+            prompt = (
+                (sys_txt + "\n" if sys_txt else "") +
+                usr_txt +
+                "\n\nIMPORTANTE: devolvé SOLO JSON válido (un array) sin texto extra."
+            )
+
+            gen_config = {
+                "temperature": temperature,
+                "response_mime_type": "application/json",
+                "max_output_tokens": max(256, min(2048, int(max_tokens))),
+            }
+
+            out = model.generate_content(prompt, generation_config=gen_config)
+
+            # Extraer texto aunque .text venga vacío
+            content = None
+            if hasattr(out, "text") and out.text:
+                content = out.text
+            elif getattr(out, "candidates", None):
+                for c in out.candidates:
+                    if getattr(c, "content", None) and getattr(c.content, "parts", None):
+                        parts_txt = "".join([getattr(p, "text", "") for p in c.content.parts if hasattr(p, "text")])
+                        if parts_txt:
+                            content = parts_txt
+                            break
+
+            if not content or not content.strip():
+                raise RuntimeError("Gemini devolvió vacío (posible filtro de seguridad). Probá menos dificultad/otro modelo.")
+
+            return content
+        except Exception as e:
+            raise RuntimeError(f"Gemini error: {e}")
+
+    # --- Cohere ---
+    if provider == "Cohere":
+        if not COHERE_API_KEY:
+            raise RuntimeError("Cohere error: falta COHERE_API_KEY.")
+        try:
+            import cohere
+            co = cohere.Client(api_key=COHERE_API_KEY)
+            sys_txt = "\n".join([m["content"] for m in messages if m["role"] == "system"])
+            usr_txt = "\n".join([m["content"] for m in messages if m["role"] == "user"])
+            prompt = (sys_txt + "\n" if sys_txt else "") + usr_txt
+            resp = co.chat(
+                model=DEFAULT_COHERE_MODEL,
+                message=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return getattr(resp, "text", None) or getattr(resp, "message", "") or ""
+        except Exception as e:
+            raise RuntimeError(f"Cohere error: {e}")
+
+    # --- Hugging Face (Inference API) ---
+    if provider == "Hugging Face":
+        if not HUGGINGFACE_API_KEY:
+            raise RuntimeError("HF error: falta HUGGINGFACE_API_KEY.")
+        try:
+            from huggingface_hub import InferenceClient
+            client = InferenceClient(token=HUGGINGFACE_API_KEY)
+            sys_txt = "\n".join([m["content"] for m in messages if m["role"] == "system"])
+            usr_txt = "\n".join([m["content"] for m in messages if m["role"] == "user"])
+            prompt = (sys_txt + "\n" if sys_txt else "") + usr_txt
+            out = client.text_generation(
+                DEFAULT_HF_MODEL,
+                prompt,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_p=0.95,
+                repetition_penalty=1.1,
+                do_sample=True,
+                stream=False,
+            )
+            return out
+        except Exception as e:
+            raise RuntimeError(f"Hugging Face error: {e}")
+
+    raise RuntimeError(f"Proveedor no soportado: {provider}")
 
 # -------- File loaders --------
 @st.cache_data(show_spinner=False)
@@ -197,7 +330,7 @@ def load_docx(file) -> str:
     doc = docx.Document(file)
     return "\n".join([p.text for p in doc.paragraphs if p.text])
 
-# ====== Normalización ======
+# ====== Normalización para evaluación ======
 def normalize_text(s: str) -> str:
     if not s:
         return ""
@@ -218,13 +351,47 @@ def best_snippet_similarity(haystack: str, needle: str):
     snippet = (haystack[:140] + "…") if len(haystack) > 140 else haystack
     return sim, snippet
 
+def normalize_for_eval(text: str) -> str:
+    return normalize_text(text)
+
+# ====== Parser robusto de JSON ======
+def parse_questions_strict(s: str):
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("Respuesta vacía del modelo.")
+    # intento directo
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # bloque ```json ... ```
+    m = re.search(r"```json\s*(\[.*?\])\s*```", s, flags=re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            pass
+    # primer array top-level
+    m2 = re.search(r"(\[.*\])", s, flags=re.S)
+    if m2:
+        try:
+            return json.loads(m2.group(1))
+        except Exception:
+            pass
+    raise ValueError("La respuesta del modelo no es JSON válido.")
+
 # ====== Sidebar ======
 with st.sidebar:
     st.header("⚙️ Opciones")
 
-    # Proveedor
+    # Proveedor de IA
     st.subheader("Proveedor de IA")
-    provider = st.radio("Elegí proveedor", ["OpenAI", "OpenRouter"], index=0, help="OpenAI recomendado")
+    provider = st.radio(
+        "Elegí proveedor",
+        ["OpenAI", "OpenRouter", "Groq", "Gemini", "Cohere", "Hugging Face"],
+        index=0,
+        help="OpenAI recomendado; Groq/Gemini/Cohere/HF tienen opciones gratuitas/limitadas."
+    )
 
     q_count = st.selectbox("Cantidad de preguntas", list(range(1, 21)), index=4)
     difficulty = st.selectbox("Dificultad", ["Fácil", "Media", "Difícil"], index=0)
@@ -238,7 +405,6 @@ with st.sidebar:
 
     with st.expander("📚 Libros de referencia (opcional)", expanded=False):
         st.caption("Ingresá **un libro por vez**. Indicá *título* y *autores* (como aparecen en librerías).")
-
         ref_title = st.text_input("Título del libro", key="ref_title")
         ref_authors = st.text_input("Autor/es", key="ref_authors")
 
@@ -269,7 +435,6 @@ with st.sidebar:
     threshold = st.slider("Umbral de aceptación (%)", 50, 95, 70) if lenient else 0
     show_diag = st.checkbox("Mostrar diagnóstico detallado", value=True)
 
-    # Mostrar uso diario y proveedor
     st.caption(f"📊 Uso diario: {st.session_state.questions_used}/{MAX_QUESTIONS_PER_DAY} preguntas")
     st.caption(f"🧠 Proveedor activo: {provider}")
 
@@ -339,7 +504,6 @@ with col1:
         if not corpus.strip():
             st.warning("Subí al menos un archivo con contenido primero.")
         else:
-            # Chequeo de cuota ANTES de invocar a la IA
             if st.session_state.questions_used + int(q_count) > MAX_QUESTIONS_PER_DAY:
                 st.warning(
                     f"⚠️ Alcanzaste el límite diario de {MAX_QUESTIONS_PER_DAY} preguntas en esta sesión. "
@@ -391,6 +555,7 @@ En las preguntas de desarrollo, incluí "puntos_clave".
 Procurá incluir también preguntas que vinculen conceptos del material con las referencias adicionales cuando sea pertinente.
 Devolvé JSON puro (sin comentarios ni texto extra).
 """
+                content = None
                 with st.spinner("Generando preguntas..."):
                     try:
                         content = call_llm(
@@ -401,21 +566,19 @@ Devolvé JSON puro (sin comentarios ni texto extra).
                             max_tokens=2000,
                             provider=provider,
                         )
-                        questions = json.loads(content)
+                        questions = parse_questions_strict(content)
                         assert isinstance(questions, list) and all("pregunta" in q for q in questions)
                         st.session_state.questions = questions
                         st.session_state.answers = {}
                         st.session_state.checked = {}
-                        st.session_state.questions_used += int(q_count)  # sumar uso solo si salió ok
+                        st.session_state.questions_used += int(q_count)
                         st.success("✅ Preguntas listas")
                     except Exception as e:
                         msg = str(e)
-                        if "OpenAI error" in msg:
-                            st.error(f"❌ {msg}. Verificá tu OPENAI_API_KEY en Secrets y el modelo.")
-                        elif "OpenRouter error" in msg:
-                            st.error(f"❌ {msg}. Si estás usando OpenRouter, revisá clave/modelo/origen.")
-                        else:
-                            st.error(f"No se pudieron generar preguntas. Detalle: {msg}")
+                        st.error(f"No se pudieron generar preguntas. Detalle: {msg}")
+                        if isinstance(content, str):
+                            st.caption("Respuesta del modelo (primeros 1000 chars):")
+                            st.code(content[:1000])
 
 with col2:
     if st.button("🧹 Borrar todo"):
@@ -425,9 +588,6 @@ with col2:
         st.rerun()
 
 # ====== Render Quiz ======
-def normalize_for_eval(text: str) -> str:
-    return normalize_text(text)
-
 if st.session_state.questions:
     st.subheader("📚 Preguntas")
     questions = st.session_state.questions
@@ -637,6 +797,7 @@ con dificultad {difficulty}, enfocadas específicamente en estos puntos débiles
 
 Devolvé JSON puro (sin texto extra).
 """
+                content = None
                 try:
                     content = call_llm(
                         [
@@ -646,7 +807,7 @@ Devolvé JSON puro (sin texto extra).
                         max_tokens=1500,
                         provider=provider,
                     )
-                    new_questions = json.loads(content)
+                    new_questions = parse_questions_strict(content)
                     assert isinstance(new_questions, list) and all("pregunta" in q for q in new_questions)
                     st.session_state.questions = new_questions
                     st.session_state.answers = {}
@@ -654,6 +815,9 @@ Devolvé JSON puro (sin texto extra).
                     st.rerun()
                 except Exception as e:
                     st.error(f"No se pudieron generar preguntas de repaso. Detalle: {e}")
+                    if isinstance(content, str):
+                        st.caption("Respuesta del modelo (primeros 1000 chars):")
+                        st.code(content[:1000])
 
 # ---- Sección de feedback (siempre visible) ----
 st.markdown(
@@ -667,7 +831,7 @@ st.markdown(
 
 # ---- Footer ----
 st.markdown("<hr/>", unsafe_allow_html=True)
-st.caption("Motor de IA: OpenAI (con opción OpenRouter como backup)")
+st.caption("Motores soportados: OpenAI · OpenRouter · Groq · Gemini · Cohere · Hugging Face")
 
 # Footer con versión dinámica
 version_str = datetime.now().strftime("%Y%m%d%H%M")
