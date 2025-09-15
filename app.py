@@ -10,6 +10,7 @@ except Exception:
 
 # ====== Imports ======
 import json
+import requests  # <-- CountAPI
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -19,16 +20,44 @@ try:
 except Exception:
     fuzz = None
 
-# ====== Config ======
+# ====== Config (API y CountAPI) ======
 load_dotenv()
 # leemos de Secrets primero, si no, del entorno
 GEMINI_API_KEY = (st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY"))
-
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
 
+# --- CountAPI (cambiá el namespace por algo único tuyo)
+COUNTAPI_NAMESPACE = "study-buddy-msl"   # EJEMPLO: "study-buddy-matia-2025"
+COUNTAPI_KEY_VISITS = "visits"
+COUNTAPI_KEY_GENERAR = "click_generar_preguntas"
+
+def countapi_hit(key: str):
+    """Incrementa contador para `key` en CountAPI."""
+    try:
+        requests.get(f"https://api.countapi.xyz/hit/{COUNTAPI_NAMESPACE}/{key}", timeout=5)
+    except Exception:
+        pass
+
+def countapi_get(key: str):
+    """Obtiene valor actual (sin incrementar)."""
+    try:
+        r = requests.get(f"https://api.countapi.xyz/get/{COUNTAPI_NAMESPACE}/{key}", timeout=5)
+        return r.json().get("value", None)
+    except Exception:
+        return None
+
+# ====== Layout ======
 st.set_page_config(page_title="📘 Study Buddy", page_icon="🤖", layout="wide")
 st.title("📘 Study Buddy — Tu compañero de estudio")
 st.caption("Cargá tu material, practicá preguntas y preparate para rendir al máximo 🚀")
+
+# ====== Contador de visitas ======
+if "countapi_counted" not in st.session_state:
+    # Primera carga de la sesión → contar una visita
+    countapi_hit(COUNTAPI_KEY_VISITS)
+    st.session_state.countapi_counted = True
+# Obtener total (no suma)
+total_views = countapi_get(COUNTAPI_KEY_VISITS)
 
 # ====== Guía rápida (expandible) ======
 with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
@@ -187,6 +216,9 @@ if "questions" not in st.session_state:
 
 # ====== Generar preguntas ======
 if st.button("🧪 Generar preguntas"):
+    # Contar clic en Generar (evento)
+    countapi_hit(COUNTAPI_KEY_GENERAR)
+
     if not corpus.strip():
         st.warning("Subí al menos un archivo con contenido primero.")
     else:
@@ -363,14 +395,10 @@ if st.session_state.questions:
 st.markdown("<hr/>", unsafe_allow_html=True)
 from datetime import datetime
 version_str = datetime.now().strftime("%Y%m%d%H%M")
+views_txt = f" · 👀 Visitas totales: {total_views}" if total_views is not None else ""
 st.markdown(
     f"<p style='text-align:center; font-size:12px; color:gray;'>"
-    f"Proyecto creado por MSL · Motor de IA: Google Gemini · versión {version_str}"
+    f"Proyecto creado por MSL · Motor de IA: Google Gemini · versión {version_str}{views_txt}"
     f"</p>",
     unsafe_allow_html=True
 )
-
-# =============================== #
-#  Nota: Si querés reactivar otros proveedores (OpenAI, Groq, etc.),
-#  volvé a la versión multiproveedor e incluye sus API keys en Secrets.
-# =============================== #
