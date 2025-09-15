@@ -177,12 +177,12 @@ with st.sidebar:
     threshold = st.slider("Umbral de aceptación (%)", 50, 95, 70) if lenient else 0
 
     # Debug opcional de CounterAPI
-    with st.expander("🔎 Analytics (debug opcional)", expanded=False):
-        st.write("Namespace:", COUNTERAPI_NAMESPACE)
-        st.write("Visitas (valor leído):", total_views)
-        st.write("Generaciones (valor leído):", total_generations)
-        if st.session_state.counter_last_error:
-            st.error(st.session_state.counter_last_error)
+ #   with st.expander("🔎 Analytics (debug opcional)", expanded=False):
+ #       st.write("Namespace:", COUNTERAPI_NAMESPACE)
+ #       st.write("Visitas (valor leído):", total_views)
+ #       st.write("Generaciones (valor leído):", total_generations)
+ #       if st.session_state.counter_last_error:
+ #           st.error(st.session_state.counter_last_error)
 
 # ====== Carga de archivos ======
 st.markdown(
