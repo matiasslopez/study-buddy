@@ -10,7 +10,7 @@ except Exception:
 
 # ====== Imports ======
 import json
-import requests  # <-- CountAPI
+import requests  # CounterAPI (counterapi.dev)
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -20,44 +20,64 @@ try:
 except Exception:
     fuzz = None
 
-# ====== Config (API y CountAPI) ======
+# ====== Config ======
 load_dotenv()
-# leemos de Secrets primero, si no, del entorno
 GEMINI_API_KEY = (st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY"))
 DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
-
-# --- CountAPI (cambiá el namespace por algo único tuyo)
-COUNTAPI_NAMESPACE = "study-buddy-msl"   # EJEMPLO: "study-buddy-matia-2025"
-COUNTAPI_KEY_VISITS = "visits"
-COUNTAPI_KEY_GENERAR = "click_generar_preguntas"
-
-def countapi_hit(key: str):
-    """Incrementa contador para `key` en CountAPI."""
-    try:
-        requests.get(f"https://api.countapi.xyz/hit/{COUNTAPI_NAMESPACE}/{key}", timeout=5)
-    except Exception:
-        pass
-
-def countapi_get(key: str):
-    """Obtiene valor actual (sin incrementar)."""
-    try:
-        r = requests.get(f"https://api.countapi.xyz/get/{COUNTAPI_NAMESPACE}/{key}", timeout=5)
-        return r.json().get("value", None)
-    except Exception:
-        return None
 
 # ====== Layout ======
 st.set_page_config(page_title="📘 Study Buddy", page_icon="🤖", layout="wide")
 st.title("📘 Study Buddy — Tu compañero de estudio")
 st.caption("Cargá tu material, practicá preguntas y preparate para rendir al máximo 🚀")
 
-# ====== Contador de visitas ======
-if "countapi_counted" not in st.session_state:
-    # Primera carga de la sesión → contar una visita
-    countapi_hit(COUNTAPI_KEY_VISITS)
-    st.session_state.countapi_counted = True
-# Obtener total (no suma)
-total_views = countapi_get(COUNTAPI_KEY_VISITS)
+# ====== CounterAPI (counterapi.dev) - visitas + generaciones ======
+# Cambiá el namespace por algo único tuyo (evitá espacios y raros)
+COUNTERAPI_NAMESPACE = "study-buddy-mati-20250915"
+COUNTER_KEY_VISITS = "visits"
+COUNTER_KEY_GENERAR = "click_generar_preguntas"
+
+COUNTERAPI_BASE = "https://api.counterapi.dev/v1"  # V1 pública (sin auth)
+
+def counter_up(namespace: str, key: str):
+    """Incrementa y retorna el valor actual; si falla devuelve (None, error_str)."""
+    url = f"{COUNTERAPI_BASE}/{namespace}/{key}/up"
+    try:
+        r = requests.get(url, timeout=6)
+        r.raise_for_status()
+        return r.json().get("count"), None
+    except Exception as e:
+        return None, f"UP {url} -> {e}"
+
+def counter_get(namespace: str, key: str):
+    """Obtiene el valor sin modificarlo; si falla devuelve (None, error_str)."""
+    url = f"{COUNTERAPI_BASE}/{namespace}/{key}"
+    try:
+        r = requests.get(url, timeout=6)
+        r.raise_for_status()
+        return r.json().get("count"), None
+    except Exception as e:
+        return None, f"GET {url} -> {e}"
+
+# Último error para debug
+if "counter_last_error" not in st.session_state:
+    st.session_state.counter_last_error = None
+
+# Inicializar/leer visitas (si no existe, el primer 'up' la crea)
+total_views, err_v = counter_get(COUNTERAPI_NAMESPACE, COUNTER_KEY_VISITS)
+if err_v:
+    st.session_state.counter_last_error = err_v
+if total_views is None:
+    _, err_u = counter_up(COUNTERAPI_NAMESPACE, COUNTER_KEY_VISITS)  # crea e incrementa
+    if err_u:
+        st.session_state.counter_last_error = err_u
+    total_views, err_v2 = counter_get(COUNTERAPI_NAMESPACE, COUNTER_KEY_VISITS)
+    if err_v2:
+        st.session_state.counter_last_error = err_v2
+
+# Leer total de generaciones (si no existe, quedará None hasta el primer clic)
+total_generations, err_g = counter_get(COUNTERAPI_NAMESPACE, COUNTER_KEY_GENERAR)
+if err_g:
+    st.session_state.counter_last_error = err_g
 
 # ====== Guía rápida (expandible) ======
 with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
@@ -68,16 +88,16 @@ with st.expander("❓ ¿Cómo lo uso? (guía rápida)", expanded=False):
 **Pasos:**
 1. **Cargá tu material:** clic en *Cargar archivo/s* y subí uno o varios documentos **TXT / PDF / DOCX** (máx. 5).  
 2. **Configurá el cuestionario:** en la barra lateral elegí **Cantidad de preguntas**, **Tipo** (opción múltiple o desarrollo) y **Dificultad** (fácil / media / difícil).  
-3. **(Opcional) Corrección flexible:** activá la casilla, y ajustá el **umbral** para que el sistema sea más o menos exigente con respuestas de desarrollo.  
+3. **(Opcional) Corrección flexible:** activá la casilla y ajustá el **umbral** para que sea más o menos exigente con respuestas de desarrollo.  
 4. **Generá preguntas:** presioná **“🧪 Generar preguntas”**.  
 5. **Respondé y verificá:** escribí tu respuesta (o elegí una opción) y tocá **“Verificar N”** para cada pregunta.  
-6. **Mirá tu resultado:** al final verás tu **puntaje** y un **porcentaje**, con indicaciones sobre qué reforzar.
+6. **Mirá tu resultado:** al final verás tu **puntaje** y **porcentaje**, con indicaciones sobre qué reforzar.
 
 > Tip: podés volver a generar otro set cambiando dificultad o cantidad de preguntas para entrenar distintos niveles.
 """
     )
 
-# ====== Helpers ======
+# ====== Helpers (Gemini) ======
 def call_gemini(messages, max_tokens=800, temperature=0.6, model=DEFAULT_GEMINI_MODEL):
     """
     Llama a Gemini forzando salida JSON.
@@ -106,7 +126,6 @@ def call_gemini(messages, max_tokens=800, temperature=0.6, model=DEFAULT_GEMINI_
         model = genai.GenerativeModel(model)
         out = model.generate_content(prompt, generation_config=gen_config)
 
-        # extraer texto aunque .text venga vacío
         content = None
         if hasattr(out, "text") and out.text:
             content = out.text
@@ -125,16 +144,14 @@ def call_gemini(messages, max_tokens=800, temperature=0.6, model=DEFAULT_GEMINI_
         raise RuntimeError(f"Gemini error: {e}")
 
 def parse_questions_strict(s: str):
-    """Intenta parsear la salida del modelo a JSON array robustamente."""
+    """Parsea la salida del modelo a JSON array de forma robusta."""
     s = (s or "").strip()
     if not s:
         raise ValueError("Respuesta vacía del modelo.")
-    # intento directo
     try:
         return json.loads(s)
     except Exception:
         pass
-    # detectar bloque ```json ... ```
     import re
     m = re.search(r"```json\s*(\[.*?\])\s*```", s, flags=re.S)
     if m:
@@ -142,7 +159,6 @@ def parse_questions_strict(s: str):
             return json.loads(m.group(1))
         except Exception:
             pass
-    # primer array top-level
     m2 = re.search(r"(\[.*\])", s, flags=re.S)
     if m2:
         try:
@@ -160,6 +176,14 @@ with st.sidebar:
     lenient = st.toggle("Corrección flexible (texto libre)", value=True)
     threshold = st.slider("Umbral de aceptación (%)", 50, 95, 70) if lenient else 0
 
+    # Debug opcional de CounterAPI
+    with st.expander("🔎 Analytics (debug opcional)", expanded=False):
+        st.write("Namespace:", COUNTERAPI_NAMESPACE)
+        st.write("Visitas (valor leído):", total_views)
+        st.write("Generaciones (valor leído):", total_generations)
+        if st.session_state.counter_last_error:
+            st.error(st.session_state.counter_last_error)
+
 # ====== Carga de archivos ======
 st.markdown(
     """
@@ -170,7 +194,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-c1, c2, c3 = st.columns([1,2,1])
+_, c2, _ = st.columns([1,2,1])
 with c2:
     uploaded = st.file_uploader("📂 Cargar archivo/s (TXT, PDF, DOCX)", type=["txt","pdf","docx"], accept_multiple_files=True)
 
@@ -216,8 +240,14 @@ if "questions" not in st.session_state:
 
 # ====== Generar preguntas ======
 if st.button("🧪 Generar preguntas"):
-    # Contar clic en Generar (evento)
-    countapi_hit(COUNTAPI_KEY_GENERAR)
+    # Contar click (crea el contador si no existe)
+    _, err_click = counter_up(COUNTERAPI_NAMESPACE, COUNTER_KEY_GENERAR)
+    if err_click:
+        st.session_state.counter_last_error = err_click
+    # refrescar total de generaciones
+    total_generations, err_g2 = counter_get(COUNTERAPI_NAMESPACE, COUNTER_KEY_GENERAR)
+    if err_g2:
+        st.session_state.counter_last_error = err_g2
 
     if not corpus.strip():
         st.warning("Subí al menos un archivo con contenido primero.")
@@ -395,10 +425,11 @@ if st.session_state.questions:
 st.markdown("<hr/>", unsafe_allow_html=True)
 from datetime import datetime
 version_str = datetime.now().strftime("%Y%m%d%H%M")
-views_txt = f" · 👀 Visitas totales: {total_views}" if total_views is not None else ""
+views_txt = f" · 👀 Visitas totales: {total_views}" if isinstance(total_views, int) else ""
+gens_txt = f" · ⚡️ Generaciones: {total_generations}" if isinstance(total_generations, int) else ""
 st.markdown(
     f"<p style='text-align:center; font-size:12px; color:gray;'>"
-    f"Proyecto creado por MSL · Motor de IA: Google Gemini · versión {version_str}{views_txt}"
+    f"Proyecto creado por MSL · Motor de IA: Google Gemini · versión {version_str}{views_txt}{gens_txt}"
     f"</p>",
     unsafe_allow_html=True
 )
